@@ -1,0 +1,9 @@
+# Ignore Python virtual environment
+venv/
+
+# Ignore Python bytecode cache
+__pycache__/
+*.py[cod]
+
+# Ignore generated JSON files
+*.json
