@@ -5,8 +5,8 @@ import re
 
 import fitz  # PyMuPDF
 
-PDF_FILE = "tkuse11.pdf"
-OUTPUT_FILE = "new_creo_api.json"
+PDF_FILE = "tkuse.pdf"
+OUTPUT_FILE = "PDFcreo_api.json"
 
 FUNCTION_NAME_RE = re.compile(r'\bPro[A-Z][A-Za-z0-9_]*(?:\(\))?')
 SECTION_HEADINGS = {

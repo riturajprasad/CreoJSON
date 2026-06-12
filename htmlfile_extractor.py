@@ -1,58 +1,573 @@
+"""
+Creo Toolkit HTML documentation extractor.
+
+Converts the local Creo Toolkit online_help HTML files into a structured
+JSON database covering functions, objects, categories, and user-guide topics.
+
+Usage:
+    python htmlfile_extractor.py <online_help_root> [-o output.json]
+    python htmlfile_extractor.py "C:/PTC/Creo 12.4.1.0/Common Files/protoolkit/online_help"
+
+Output sections:
+    metadata     – extraction info
+    summary      – file / entry counts
+    categories   – API category index (Objects + Functions per category)
+    objects      – ProXxx object descriptions, inheritance, function lists
+    functions    – full function signatures with parameters and return codes
+    user_guide   – user-guide topic titles and content
+"""
+
 import argparse
 import json
 import re
 import sys
 from pathlib import Path
-from html.parser import HTMLParser
 
 try:
-    from bs4 import BeautifulSoup
+    from bs4 import BeautifulSoup, Tag
 except ImportError:
-    BeautifulSoup = None
+    print("ERROR: BeautifulSoup4 is required.  pip install beautifulsoup4", file=sys.stderr)
+    sys.exit(1)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Constants
+# ──────────────────────────────────────────────────────────────────────────────
 
 HTML_EXTENSIONS = ('.html', '.htm')
-DEFAULT_EXCLUDE_DIRS = {
-    '.git',
-    '.hg',
-    '.svn',
-    '__pycache__',
-    '.mypy_cache',
-    '.pytest_cache',
-    'node_modules',
-    'venv',
-    '.venv',
-}
+DEFAULT_EXCLUDE_DIRS = {'.git', '__pycache__', 'node_modules', 'css', 'scripts',
+                        'images', 'wwhelp', 'connect'}
 
 
-def normalize_space(text):
-    """Normalize whitespace in text."""
-    return re.sub(r'\s+', ' ', text or '').strip()
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def normalize(text: str) -> str:
+    return re.sub(r'\s+', ' ', (text or '')).strip()
 
 
-def read_text(path):
-    """Read file with multiple encoding attempts."""
-    for encoding in ('utf-8-sig', 'utf-8', 'cp1252', 'latin-1'):
+def read_html(path: Path) -> str:
+    for enc in ('utf-8-sig', 'utf-8', 'cp1252', 'latin-1'):
         try:
-            return path.read_text(encoding=encoding), encoding
+            return path.read_text(encoding=enc)
         except UnicodeDecodeError:
             continue
-    return path.read_text(errors='replace'), 'unknown'
+    return path.read_text(errors='replace')
 
 
-def discover_html_files(source, extensions, exclude_dirs):
-    """Discover HTML files in source directory or return single file."""
-    source = Path(source)
-    normalized_exts = {ext.lower() if ext.startswith('.') else f'.{ext.lower()}' for ext in extensions}
+def rel_path(path: Path, root: Path) -> str:
+    try:
+        return str(path.relative_to(root)).replace('\\', '/')
+    except ValueError:
+        return str(path).replace('\\', '/')
 
+
+def soup_text(tag) -> str:
+    return normalize(tag.get_text()) if tag else ''
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Page-type detection
+# ──────────────────────────────────────────────────────────────────────────────
+
+PAGE_FUNCTION = 'function'
+PAGE_OBJECT   = 'object'
+PAGE_CATEGORY = 'category'
+PAGE_USERGUIDE = 'user_guide'
+PAGE_OTHER    = 'other'
+
+
+def detect_page_type(soup: BeautifulSoup, rel_p: str) -> str:
+    # Path-based routing takes priority — user_guide pages have arbitrary titles.
+    if 'user_guide' in rel_p or 'get_started' in rel_p:
+        return PAGE_USERGUIDE
+
+    title_tag = soup.find('title')
+    title = normalize(title_tag.get_text()) if title_tag else ''
+
+    if 'api/dita' in rel_p:
+        if title.startswith('Function ') or title.startswith('Callback '):
+            return PAGE_FUNCTION
+        if title.startswith('Object '):
+            return PAGE_OBJECT
+        if soup.find(class_='Heading_1'):
+            return PAGE_CATEGORY
+        return PAGE_OTHER
+
+    # Non-dita API pages at the creo_toolkit root level
+    if title.startswith('Function ') or title.startswith('Callback '):
+        return PAGE_FUNCTION
+    if title.startswith('Object '):
+        return PAGE_OBJECT
+
+    return PAGE_OTHER
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Breadcrumb parser  →  {'category': str, 'object': str}
+# ──────────────────────────────────────────────────────────────────────────────
+
+def parse_breadcrumb(soup: BeautifulSoup) -> dict:
+    crumbs_div = soup.find(class_='ww_skin_breadcrumbs')
+    if not crumbs_div:
+        return {'category': '', 'object': ''}
+    links = [normalize(a.get_text()) for a in crumbs_div.find_all('a')]
+    # links: ['API Documentation', '<category>', '<object>']  (1–3 items)
+    result = {'category': '', 'object': ''}
+    if len(links) >= 2:
+        result['category'] = links[1]
+    if len(links) >= 3:
+        result['object'] = links[2].replace('Object ', '')
+    return result
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Synopsis / parameter parser  (function pages)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _find_section(soup: BeautifulSoup, section_name: str):
+    """Return the next sibling element after a Section_Title whose text matches."""
+    for div in soup.find_all(class_='Section_Title'):
+        if normalize(div.get_text()) == section_name:
+            return div
+    return None
+
+
+def parse_include_header(soup: BeautifulSoup) -> str:
+    pre = soup.find(class_='Preformatted')
+    if not pre:
+        return ''
+    text = normalize(pre.get_text())
+    m = re.search(r'#include\s*[<"]([^>"]+)[>"]', text)
+    return m.group(1) if m else text
+
+
+def parse_synopsis_table(soup: BeautifulSoup) -> dict:
+    """
+    Parse the synopsis noborders table for return type, function name,
+    and parameters.
+
+    Table structure:
+      Row 0: [return_type] [function_name]
+      Row 1: []            [(  param_type param_name  /* (Dir) desc */  ...  )]
+    """
+    synopsis_div = _find_section(soup, 'Synopsis')
+    if not synopsis_div:
+        return {'return_type': '', 'name': '', 'parameters': []}
+
+    # Find the next table sibling after the synopsis section title
+    table = None
+    for sibling in synopsis_div.next_siblings:
+        if isinstance(sibling, Tag):
+            t = sibling.find('table')
+            if t:
+                table = t
+                break
+            if sibling.name == 'table':
+                table = sibling
+                break
+
+    if not table:
+        return {'return_type': '', 'name': '', 'parameters': []}
+
+    rows = table.find_all('tr')
+    if not rows:
+        return {'return_type': '', 'name': '', 'parameters': []}
+
+    # Row 0: return type (col 0) and function name (col 1)
+    cells_row0 = rows[0].find_all('td')
+    return_type = normalize(cells_row0[0].get_text()) if len(cells_row0) > 0 else ''
+    func_name   = normalize(cells_row0[1].get_text()) if len(cells_row0) > 1 else ''
+
+    # Row 1 col 1: all Table_Cell divs form the parameter block
+    parameters = []
+    if len(rows) > 1:
+        cells_row1 = rows[1].find_all('td')
+        param_cell = cells_row1[1] if len(cells_row1) > 1 else (cells_row1[0] if cells_row1 else None)
+        if param_cell:
+            divs = [normalize(d.get_text()) for d in param_cell.find_all(class_='Table_Cell')]
+            parameters = _parse_param_divs(divs)
+
+    return {'return_type': return_type, 'name': func_name, 'parameters': parameters}
+
+
+def _parse_param_divs(divs: list) -> list:
+    """
+    Parse a flat list of Table_Cell texts into parameter dicts.
+
+    Pattern per parameter (after opening '('):
+        <type_and_name>        e.g. 'ProMdl mdl'  or 'wchar_t* name'
+        /* (In)                direction token
+        description text
+        */
+    """
+    params = []
+    i = 0
+    # Skip leading '('
+    while i < len(divs) and divs[i] in ('(', ''):
+        i += 1
+
+    while i < len(divs):
+        token = divs[i]
+        if token in (')', ''):
+            i += 1
+            continue
+
+        # A parameter declaration line: does NOT start with '/*'
+        if token.startswith('/*') or token.startswith('*/'):
+            i += 1
+            continue
+
+        decl = token
+        direction = ''
+        description = ''
+        i += 1
+
+        # Next should be /* (Dir)
+        if i < len(divs) and divs[i].startswith('/*'):
+            dir_text = divs[i]
+            m = re.search(r'\(([^)]+)\)', dir_text)
+            direction = m.group(1).strip() if m else ''
+            i += 1
+
+        # Collect description lines until '*/'
+        desc_parts = []
+        while i < len(divs) and not divs[i].startswith('*/'):
+            if divs[i]:
+                desc_parts.append(divs[i])
+            i += 1
+        description = ' '.join(desc_parts)
+        if i < len(divs) and divs[i].startswith('*/'):
+            i += 1
+
+        param_type, param_name = _split_type_name(decl)
+        if param_type or param_name:
+            params.append({
+                'type': param_type,
+                'name': param_name,
+                'direction': direction,
+                'description': description,
+            })
+
+    return params
+
+
+def _split_type_name(decl: str) -> tuple:
+    """Split 'ProMdl mdl' → ('ProMdl', 'mdl'), 'wchar_t* name' → ('wchar_t*', 'name')."""
+    parts = decl.rsplit(None, 1)
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip()
+    if len(parts) == 1:
+        # Could be just a type with no variable name (e.g. 'void')
+        return parts[0].strip(), ''
+    return '', ''
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Returns / error-code parser
+# ──────────────────────────────────────────────────────────────────────────────
+
+def parse_returns(soup: BeautifulSoup) -> list:
+    """
+    Returns section: noborders table where col 0 = error code, col 1 = message.
+    """
+    returns_div = _find_section(soup, 'Returns')
+    if not returns_div:
+        return []
+
+    table = None
+    for sibling in returns_div.next_siblings:
+        if isinstance(sibling, Tag):
+            t = sibling.find('table')
+            if t:
+                table = t
+                break
+            if sibling.name == 'table':
+                table = sibling
+                break
+
+    if not table:
+        return []
+
+    results = []
+    for row in table.find_all('tr'):
+        cells = row.find_all('td')
+        if len(cells) >= 2:
+            code = normalize(cells[0].get_text())
+            msg  = normalize(cells[1].get_text())
+            if code:
+                results.append({'code': code, 'description': msg})
+    return results
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OTK replacement parser
+# ──────────────────────────────────────────────────────────────────────────────
+
+def parse_otk_replacement(soup: BeautifulSoup) -> str:
+    """Extract 'Replacement in Object TOOLKIT' value if present."""
+    for div in soup.find_all(class_='Section_Title'):
+        if 'Replacement' in normalize(div.get_text()):
+            # Find next table
+            for sib in div.next_siblings:
+                if isinstance(sib, Tag):
+                    t = sib.find('table')
+                    if t:
+                        rows = t.find_all('tr')
+                        if rows:
+                            cells = rows[0].find_all('td')
+                            if len(cells) >= 2:
+                                return normalize(cells[1].get_text())
+                        break
+    return ''
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# User guide reference parser
+# ──────────────────────────────────────────────────────────────────────────────
+
+def parse_user_guide_refs(soup: BeautifulSoup) -> list:
+    refs_div = _find_section(soup, 'User Guide References')
+    if not refs_div:
+        return []
+    refs = []
+    for sib in refs_div.next_siblings:
+        if isinstance(sib, Tag):
+            text = normalize(sib.get_text())
+            if not text:
+                continue
+            cls = sib.get('class', [])
+            if isinstance(cls, list):
+                cls = ' '.join(cls)
+            if 'Definition_Term' in cls or 'Body' in cls:
+                refs.append(text)
+            elif 'Section_Title' in cls or 'Figure' in cls:
+                break
+    return refs
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Body-text extractor (description, first Body div after a Section_Title)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def get_section_body(soup: BeautifulSoup, section_name: str) -> str:
+    sec = _find_section(soup, section_name)
+    if not sec:
+        return ''
+    for sib in sec.next_siblings:
+        if isinstance(sib, Tag):
+            cls = sib.get('class', [])
+            if isinstance(cls, list):
+                cls = ' '.join(cls)
+            if 'Body' in cls or 'Section_Body' in cls:
+                return normalize(sib.get_text())
+            if 'Section_Title' in cls or 'Figure' in cls:
+                break
+    return ''
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Page-type specific parsers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def parse_function_page(soup: BeautifulSoup, rel_p: str) -> dict:
+    title_tag = soup.find('title')
+    raw_title = normalize(title_tag.get_text()) if title_tag else ''
+    func_kind = 'Callback' if raw_title.startswith('Callback') else 'Function'
+    name = re.sub(r'^(Function|Callback)\s+', '', raw_title).strip()
+
+    breadcrumb = parse_breadcrumb(soup)
+    description = get_section_body(soup, 'Description')
+    include_header = parse_include_header(soup)
+    synopsis = parse_synopsis_table(soup)
+    returns = parse_returns(soup)
+    otk = parse_otk_replacement(soup)
+    ug_refs = parse_user_guide_refs(soup)
+
+    return {
+        'kind': func_kind,
+        'name': name or synopsis.get('name', ''),
+        'source_file': rel_p,
+        'category': breadcrumb['category'],
+        'object': breadcrumb['object'],
+        'description': description,
+        'include_header': include_header,
+        'return_type': synopsis.get('return_type', ''),
+        'parameters': synopsis.get('parameters', []),
+        'returns': returns,
+        'otk_replacement': otk,
+        'user_guide_refs': ug_refs,
+    }
+
+
+def parse_object_page(soup: BeautifulSoup, rel_p: str) -> dict:
+    title_tag = soup.find('title')
+    name = normalize(title_tag.get_text()).replace('Object ', '').strip() if title_tag else ''
+    breadcrumb = parse_breadcrumb(soup)
+
+    # Description: first Body div after Heading_2
+    description = ''
+    h2 = soup.find(class_='Heading_2')
+    if h2:
+        for sib in h2.next_siblings:
+            if isinstance(sib, Tag):
+                cls = ' '.join(sib.get('class', []))
+                if 'Body' in cls:
+                    text = normalize(sib.get_text())
+                    if text and not text.startswith('•'):
+                        description = text
+                        break
+                if 'Heading' in cls:
+                    break
+
+    def get_links_after(section_title: str) -> list:
+        sec = _find_section(soup, section_title)
+        if not sec:
+            return []
+        links = []
+        for sib in sec.next_siblings:
+            if isinstance(sib, Tag):
+                cls = ' '.join(sib.get('class', []))
+                if 'Body' in cls:
+                    for a in sib.find_all('a', title=True):
+                        title = a.get('title', '')
+                        clean = re.sub(r'^(Object|Function|Callback)\s+', '', title).strip()
+                        if clean:
+                            links.append(clean)
+                if 'Section_Title' in cls or 'Figure' in cls:
+                    break
+        return links
+
+    superobjects = get_links_after('Superobjects:')
+    attribute_of = get_links_after('This object is an attribute of the following objects:')
+
+    # Functions: find Section_Title containing 'Functions:'
+    own_functions = []
+    inherited_functions = []
+    for div in soup.find_all(class_='Section_Title'):
+        text = normalize(div.get_text())
+        if 'Functions:' in text and 'inherited' not in text.lower():
+            for sib in div.next_siblings:
+                if isinstance(sib, Tag):
+                    cls = ' '.join(sib.get('class', []))
+                    if 'Body' in cls:
+                        for a in sib.find_all('a', title=True):
+                            t = normalize(a.get('title', ''))
+                            n = re.sub(r'^(Function|Callback)\s+', '', t).strip()
+                            if n:
+                                own_functions.append(n)
+                    if 'Section_Title' in cls or 'Figure' in cls:
+                        break
+        elif 'inherited' in text.lower() and 'Functions' in text:
+            for sib in div.next_siblings:
+                if isinstance(sib, Tag):
+                    cls = ' '.join(sib.get('class', []))
+                    if 'Body' in cls:
+                        for a in sib.find_all('a', title=True):
+                            t = normalize(a.get('title', ''))
+                            n = re.sub(r'^(Function|Callback)\s+', '', t).strip()
+                            if n:
+                                inherited_functions.append(n)
+                    if 'Section_Title' in cls or 'Figure' in cls:
+                        break
+
+    return {
+        'name': name,
+        'source_file': rel_p,
+        'category': breadcrumb['category'],
+        'description': description,
+        'superobjects': superobjects,
+        'attribute_of': attribute_of,
+        'functions': own_functions,
+        'inherited_functions': inherited_functions,
+    }
+
+
+def parse_category_page(soup: BeautifulSoup, rel_p: str) -> dict:
+    title_tag = soup.find('title')
+    name = normalize(title_tag.get_text()) if title_tag else ''
+
+    functions = []
+    objects = []
+    for div in soup.find_all(class_='Section_Title'):
+        section = normalize(div.get_text())
+        target = None
+        if section == 'Functions':
+            target = functions
+        elif section == 'Objects':
+            target = objects
+        else:
+            continue
+        for sib in div.next_siblings:
+            if isinstance(sib, Tag):
+                cls = ' '.join(sib.get('class', []))
+                if 'List_1' in cls or 'Body' in cls:
+                    for a in sib.find_all('a', title=True):
+                        t = normalize(a.get('title', ''))
+                        n = re.sub(r'^(Function|Callback|Object)\s+', '', t).strip()
+                        if n:
+                            target.append(n)
+                if 'Section_Title' in cls or 'Heading' in cls:
+                    break
+
+    return {
+        'name': name,
+        'source_file': rel_p,
+        'functions': functions,
+        'objects': objects,
+    }
+
+
+def parse_userguide_page(soup: BeautifulSoup, rel_p: str) -> dict:
+    title_tag = soup.find('title')
+    title = normalize(title_tag.get_text()) if title_tag else ''
+
+    # Remove boilerplate elements
+    for tag in soup(['script', 'style', 'header', 'footer', 'nav']):
+        tag.decompose()
+
+    content_div = soup.find(id='page_content')
+    if not content_div:
+        content_div = soup.find(id='page_content_container') or soup.body
+
+    headings = []
+    paragraphs = []
+    code_blocks = []
+
+    if content_div:
+        for tag in content_div.find_all(True):
+            cls = ' '.join(tag.get('class', []))
+            text = normalize(tag.get_text())
+            if not text:
+                continue
+            if any(c in cls for c in ('Heading_1', 'Heading_2', 'Heading_3')):
+                headings.append(text)
+            elif 'Preformatted' in cls or tag.name in ('pre', 'code'):
+                code_blocks.append(text)
+            elif 'Body' in cls and tag.name == 'div':
+                paragraphs.append(text)
+
+    return {
+        'title': title,
+        'source_file': rel_p,
+        'headings': headings[:20],
+        'paragraphs': paragraphs[:30],
+        'code_blocks': code_blocks[:20],
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# File discovery
+# ──────────────────────────────────────────────────────────────────────────────
+
+def discover_html_files(source: Path, exclude_dirs: set) -> list:
     if source.is_file():
-        return [source] if source.suffix.lower() in normalized_exts else []
-
+        return [source]
     files = []
     for path in source.rglob('*'):
         if not path.is_file():
             continue
-        if path.suffix.lower() not in normalized_exts:
+        if path.suffix.lower() not in HTML_EXTENSIONS:
             continue
         if any(part in exclude_dirs for part in path.parts):
             continue
@@ -60,422 +575,125 @@ def discover_html_files(source, extensions, exclude_dirs):
     return sorted(files)
 
 
-def extract_text_from_html(html_content):
-    """Extract plain text from HTML content."""
-    if not BeautifulSoup:
-        # Fallback: basic HTML tag removal
-        text = re.sub(r'<[^>]+>', ' ', html_content)
-        return normalize_space(text)
-    
-    soup = BeautifulSoup(html_content, 'html.parser')
-    # Remove script and style elements
-    for script in soup(['script', 'style']):
-        script.decompose()
-    text = soup.get_text()
-    return normalize_space(text)
+# ──────────────────────────────────────────────────────────────────────────────
+# Main extractor
+# ──────────────────────────────────────────────────────────────────────────────
 
+def extract_all(source: Path, exclude_dirs: set, verbose: bool = False) -> dict:
+    root = source if source.is_dir() else source.parent
+    files = discover_html_files(source, exclude_dirs)
 
-def extract_headings(html_content):
-    """Extract headings from HTML."""
-    if not BeautifulSoup:
-        headings = re.findall(r'<h[1-6][^>]*>([^<]+)</h[1-6]>', html_content, re.IGNORECASE)
-        return [normalize_space(h) for h in headings]
-    
-    soup = BeautifulSoup(html_content, 'html.parser')
-    headings = []
-    for h in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
-        text = normalize_space(h.get_text())
-        if text:
-            headings.append(text)
-    return headings
+    categories  = []
+    objects     = []
+    functions   = []
+    user_guide  = []
+    skipped     = 0
 
+    total = len(files)
+    for i, path in enumerate(files):
+        rp = rel_path(path, root)
+        if verbose and i % 500 == 0:
+            print(f"  [{i}/{total}] {rp}", flush=True)
 
-def extract_tables_data(html_content):
-    """Extract data from HTML tables."""
-    if not BeautifulSoup:
-        return []
-    
-    try:
-        soup = BeautifulSoup(html_content, 'html.parser')
-        tables_data = []
-        
-        for table in soup.find_all('table'):
-            rows = []
-            # Get headers
-            headers = []
-            for th in table.find_all('th'):
-                headers.append(normalize_space(th.get_text()))
-            
-            # Get rows
-            for tr in table.find_all('tr'):
-                cells = []
-                for td in tr.find_all(['td', 'th']):
-                    cells.append(normalize_space(td.get_text()))
-                if cells:
-                    rows.append(cells)
-            
-            if headers or rows:
-                tables_data.append({
-                    'headers': headers,
-                    'rows': rows,
-                })
-        
-        return tables_data
-    except Exception:
-        return []
+        try:
+            html = read_html(path)
+            soup = BeautifulSoup(html, 'html.parser')
+            page_type = detect_page_type(soup, rp)
 
+            if page_type == PAGE_FUNCTION:
+                functions.append(parse_function_page(soup, rp))
+            elif page_type == PAGE_OBJECT:
+                objects.append(parse_object_page(soup, rp))
+            elif page_type == PAGE_CATEGORY:
+                categories.append(parse_category_page(soup, rp))
+            elif page_type == PAGE_USERGUIDE:
+                user_guide.append(parse_userguide_page(soup, rp))
+            else:
+                skipped += 1
+        except Exception as exc:
+            if verbose:
+                print(f"  WARNING: {rp}: {exc}", file=sys.stderr)
+            skipped += 1
 
-def extract_code_blocks(html_content):
-    """Extract code blocks from HTML."""
-    if not BeautifulSoup:
-        # Fallback: extract from <code> or <pre> tags
-        codes = re.findall(r'<(?:code|pre)[^>]*>([^<]+)</(?:code|pre)>', html_content, re.IGNORECASE)
-        return [normalize_space(c) for c in codes]
-    
-    try:
-        soup = BeautifulSoup(html_content, 'html.parser')
-        code_blocks = []
-        
-        for code in soup.find_all(['code', 'pre']):
-            text = code.get_text()
-            text = normalize_space(text)
-            if text:
-                code_blocks.append(text)
-        
-        return code_blocks
-    except Exception:
-        return []
+    # Sort for stable output
+    functions.sort(key=lambda x: x['name'])
+    objects.sort(key=lambda x: x['name'])
+    categories.sort(key=lambda x: x['name'])
+    user_guide.sort(key=lambda x: x['title'])
 
-
-def extract_paragraphs(html_content):
-    """Extract paragraphs from HTML."""
-    if not BeautifulSoup:
-        # Fallback: extract from <p> tags
-        paragraphs = re.findall(r'<p[^>]*>([^<]+(?:<[^/>]*>[^<]*)*)</p>', html_content, re.IGNORECASE)
-        return [normalize_space(p) for p in paragraphs if normalize_space(p)]
-    
-    try:
-        soup = BeautifulSoup(html_content, 'html.parser')
-        paragraphs = []
-        
-        for p in soup.find_all('p'):
-            text = normalize_space(p.get_text())
-            if text:
-                paragraphs.append(text)
-        
-        return paragraphs
-    except Exception:
-        return []
-
-
-def extract_lists(html_content):
-    """Extract lists from HTML."""
-    if not BeautifulSoup:
-        return []
-    
-    try:
-        soup = BeautifulSoup(html_content, 'html.parser')
-        lists_data = []
-        
-        for ul in soup.find_all(['ul', 'ol']):
-            items = []
-            for li in ul.find_all('li', recursive=False):
-                text = normalize_space(li.get_text())
-                if text:
-                    items.append(text)
-            if items:
-                lists_data.append({
-                    'type': ul.name,
-                    'items': items,
-                })
-        
-        return lists_data
-    except Exception:
-        return []
-
-
-def parse_function_signature(text):
-    """Parse function signature from text."""
-    # Match patterns like: function_name(param1, param2) or void function_name(...)
-    match = re.search(r'(?:[\w:<>*&\s]+\s+)?(\w+)\s*\(([^)]*)\)', text)
-    if match:
-        func_name = match.group(1)
-        params_str = match.group(2)
-        
-        # Parse parameters
-        params = []
-        if params_str.strip() and params_str.lower() != 'void':
-            for param in re.split(r',', params_str):
-                param = normalize_space(param)
-                if param:
-                    # Try to extract type and name
-                    parts = param.rsplit(None, 1)
-                    if len(parts) == 2:
-                        params.append({
-                            'name': parts[1],
-                            'type': parts[0],
-                            'description': '',
-                        })
-                    else:
-                        params.append({
-                            'name': param,
-                            'type': '',
-                            'description': '',
-                        })
-        
-        return {
-            'name': func_name,
-            'parameters': params,
-            'return_type': '',
-            'description': '',
-        }
-    return None
-
-
-def extract_apis_from_content(html_content):
-    """Extract API definitions from HTML content."""
-    apis = []
-    
-    # Try to find structured API information
-    code_blocks = extract_code_blocks(html_content)
-    for code in code_blocks:
-        func = parse_function_signature(code)
-        if func:
-            apis.append(func)
-    
-    # Extract from tables (common in API docs)
-    tables = extract_tables_data(html_content)
-    for table in tables:
-        if table['headers']:
-            # Check if this looks like a parameters/API table
-            header_lower = [h.lower() for h in table['headers']]
-            if any(keyword in header_lower for keyword in ['parameter', 'param', 'name', 'type']):
-                apis.append({
-                    'name': 'Table_Data',
-                    'parameters': [],
-                    'table': table,
-                    'description': 'Parameters table extracted from HTML',
-                })
-    
-    return apis
-
-
-def extract_html_file(path, root):
-    """Extract API information from a single HTML file."""
-    text, encoding = read_text(path)
-    file_path = relative_file_path(path, root)
-    
-    # Extract various components
-    headings = extract_headings(text)
-    paragraphs = extract_paragraphs(text)
-    code_blocks = extract_code_blocks(text)
-    tables = extract_tables_data(text)
-    lists = extract_lists(text)
-    apis = extract_apis_from_content(text)
-    plain_text = extract_text_from_html(text)
-    
-    # Extract any API definitions and descriptions
-    methods = []
-    for heading in headings:
-        # Try to match function-like names in headings
-        if '(' in heading and ')' in heading:
-            func = parse_function_signature(heading)
-            if func:
-                func['description'] = paragraphs[0] if paragraphs else heading
-                methods.append(func)
-    
-    # Build return structure
-    result = {
-        'path': file_path,
-        'encoding': encoding,
-        'title': headings[0] if headings else 'Untitled',
-        'counts': {
-            'headings': len(headings),
-            'paragraphs': len(paragraphs),
-            'code_blocks': len(code_blocks),
-            'tables': len(tables),
-            'lists': len(lists),
-            'apis': len(apis),
-        },
+    return {
         'metadata': {
-            'headings': headings[:10],  # First 10 headings
-            'summary': plain_text[:500] if plain_text else '',  # First 500 chars of plain text
-        },
-        'content': {
-            'paragraphs': paragraphs,
-            'code_blocks': code_blocks,
-            'tables': tables,
-            'lists': lists,
-        },
-        'apis': apis,
-        'methods': methods,
-    }
-    
-    return result
-
-
-def relative_file_path(path, root):
-    """Get relative file path."""
-    try:
-        return str(path.relative_to(root)).replace('\\', '/')
-    except ValueError:
-        return str(path).replace('\\', '/')
-
-
-def merge_results(file_results, source_root):
-    """Merge all file extraction results."""
-    result = {
-        'metadata': {
-            'format_version': 1,
-            'source_root': str(source_root),
+            'format_version': 2,
+            'source_root': str(root),
             'extractor': 'htmlfile_extractor.py',
         },
         'summary': {
-            'files': len(file_results),
-            'total_headings': 0,
-            'total_paragraphs': 0,
-            'total_code_blocks': 0,
-            'total_tables': 0,
-            'total_lists': 0,
-            'total_apis': 0,
+            'total_files_scanned': total,
+            'functions': len(functions),
+            'objects': len(objects),
+            'categories': len(categories),
+            'user_guide': len(user_guide),
+            'skipped': skipped,
         },
-        'files': [],
-        'apis': [],
-        'all_content': {
-            'headings': [],
-            'paragraphs': [],
-            'code_blocks': [],
-            'tables': [],
-            'lists': [],
-        },
+        'categories': categories,
+        'objects': objects,
+        'functions': functions,
+        'user_guide': user_guide,
     }
-    
-    for file_result in file_results:
-        result['files'].append({
-            'path': file_result['path'],
-            'encoding': file_result['encoding'],
-            'title': file_result['title'],
-            'counts': file_result['counts'],
-        })
-        
-        # Update summary counts
-        for key in ['headings', 'paragraphs', 'code_blocks', 'tables', 'lists', 'apis']:
-            result['summary'][f'total_{key}'] += file_result['counts'].get(key, 0)
-        
-        # Collect all APIs
-        for api in file_result['apis']:
-            api['source_file'] = file_result['path']
-            result['apis'].append(api)
-        
-        # Collect all content
-        if file_result['content'].get('headings'):
-            result['all_content']['headings'].extend([
-                {'file': file_result['path'], 'text': h} 
-                for h in file_result['content']['headings']
-            ])
-        if file_result['content'].get('paragraphs'):
-            result['all_content']['paragraphs'].extend([
-                {'file': file_result['path'], 'text': p} 
-                for p in file_result['content']['paragraphs'][:5]  # Limit to first 5
-            ])
-        if file_result['content'].get('code_blocks'):
-            result['all_content']['code_blocks'].extend([
-                {'file': file_result['path'], 'code': c} 
-                for c in file_result['content']['code_blocks']
-            ])
-        if file_result['content'].get('tables'):
-            result['all_content']['tables'].extend([
-                {'file': file_result['path'], 'table': t} 
-                for t in file_result['content']['tables']
-            ])
-        if file_result['content'].get('lists'):
-            result['all_content']['lists'].extend([
-                {'file': file_result['path'], 'list': lst} 
-                for lst in file_result['content']['lists']
-            ])
-    
-    return result
 
 
-def extract_html_files(source, extensions=HTML_EXTENSIONS, exclude_dirs=None):
-    """Extract all HTML files from source."""
-    source = Path(source).resolve()
-    exclude_dirs = set(exclude_dirs or [])
-    root = source.parent if source.is_file() else source
-    files = discover_html_files(source, extensions, exclude_dirs)
-    
-    if not files:
-        print(f"Warning: No HTML files found in {source}")
-        return merge_results([], root)
-    
-    file_results = [extract_html_file(path, root) for path in files]
-    return merge_results(file_results, root)
-
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────────────────────
 
 def parse_args(argv):
-    """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(
-        description='Extract API documentation from HTML files into JSON format.',
+    p = argparse.ArgumentParser(
+        description='Extract Creo Toolkit HTML documentation into JSON.',
     )
-    parser.add_argument('source', help='HTML file or folder containing .html/.htm files.')
-    parser.add_argument(
-        '-o',
-        '--output',
-        default='htmlfiles_api.json',
-        help='Output JSON file. Default: htmlfiles_api.json',
-    )
-    parser.add_argument(
-        '--extensions',
-        nargs='+',
-        default=list(HTML_EXTENSIONS),
-        help='HTML extensions to scan. Default: .html .htm',
-    )
-    parser.add_argument(
-        '--exclude-dir',
-        action='append',
-        default=[],
-        help='Directory name to skip. Can be used multiple times.',
-    )
-    parser.add_argument(
-        '--no-default-excludes',
-        action='store_true',
-        help='Do not skip common generated/dependency folders.',
-    )
-    parser.add_argument(
-        '--stdout',
-        action='store_true',
-        help='Print JSON to stdout instead of writing --output.',
-    )
-    parser.add_argument(
-        '--stats-only',
-        action='store_true',
-        help='Only print extraction counts.',
-    )
-    return parser.parse_args(argv)
+    p.add_argument('source',
+                   help='Path to the Creo online_help root directory (or a single HTML file).')
+    p.add_argument('-o', '--output', default='creo_toolkit_api.json',
+                   help='Output JSON file. Default: creo_toolkit_api.json')
+    p.add_argument('--exclude-dir', action='append', default=[],
+                   metavar='DIR', help='Directory name to skip (repeatable).')
+    p.add_argument('--no-default-excludes', action='store_true',
+                   help='Do not apply the built-in exclude list.')
+    p.add_argument('--stdout', action='store_true',
+                   help='Print JSON to stdout.')
+    p.add_argument('--stats-only', action='store_true',
+                   help='Print summary counts only.')
+    p.add_argument('-v', '--verbose', action='store_true',
+                   help='Print progress while scanning.')
+    return p.parse_args(argv)
 
 
 def main(argv=None):
-    """Main entry point."""
     args = parse_args(argv or sys.argv[1:])
-    exclude_dirs = set(args.exclude_dir)
+    source = Path(args.source).resolve()
+
+    exclude = set(args.exclude_dir)
     if not args.no_default_excludes:
-        exclude_dirs.update(DEFAULT_EXCLUDE_DIRS)
-    
-    result = extract_html_files(args.source, args.extensions, exclude_dirs)
-    
+        exclude.update(DEFAULT_EXCLUDE_DIRS)
+
+    print(f"Scanning {source} …", flush=True)
+    result = extract_all(source, exclude, verbose=args.verbose)
+
     if args.stats_only:
         print(json.dumps(result['summary'], indent=2))
         return 0
-    
+
+    payload = json.dumps(result, indent=2, ensure_ascii=False)
+
     if args.stdout:
-        print(json.dumps(result, indent=2, ensure_ascii=False))
+        print(payload)
         return 0
-    
-    output_path = Path(args.output)
-    if output_path.parent != Path('.'):
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding='utf-8')
-    print(f"Extracted {result['summary']['files']} HTML files to {output_path}")
+
+    out = Path(args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(payload, encoding='utf-8')
+    s = result['summary']
+    print(f"Done: {s['functions']} functions, {s['objects']} objects, "
+          f"{s['categories']} categories, {s['user_guide']} user-guide pages -> {out}")
     return 0
 
 
