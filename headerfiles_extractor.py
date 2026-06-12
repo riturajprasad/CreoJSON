@@ -105,6 +105,18 @@ SECTION_ALIASES = {
     'class hierarchy': 'hierarchy',
     'inheritance hierarchy': 'hierarchy',
     'inheritance': 'hierarchy',
+    # Creo ProToolkit-specific section headings
+    'deprecated': 'deprecated',
+    'successors': 'successors',
+    'successor': 'successors',
+    'see also': 'see_also',
+    'see': 'see_also',
+    'note': 'notes',
+    'notes': 'notes',
+    'remark': 'notes',
+    'remarks': 'notes',
+    'example': 'notes',
+    'examples': 'notes',
 }
 
 
@@ -262,6 +274,22 @@ def nearest_comment_text(comments, code_lines, line_number, max_gap=5):
     return ''
 
 
+def nearest_comment_text_after(comments, line_number, max_gap=3):
+    """Find the first comment that begins within max_gap lines AFTER line_number.
+
+    Used for Creo ProToolkit headers where documentation blocks appear
+    immediately after each extern function declaration rather than before it.
+    """
+    for comment in comments:
+        if comment['start_line'] <= line_number:
+            continue
+        if comment['start_line'] - line_number > max_gap:
+            break
+        if comment['text']:
+            return comment['text']
+    return ''
+
+
 def normalize_direction(direction):
     if not direction:
         return None
@@ -321,6 +349,10 @@ def parse_doc(text):
             'lines': [],
             'symbols': [],
         },
+        'see_also': [],
+        'deprecated': None,
+        'successors': [],
+        'notes': '',
     }
     if not text:
         return result
@@ -329,6 +361,10 @@ def parse_doc(text):
     description_lines = []
     return_lines = []
     hierarchy_lines = []
+    see_also_lines = []
+    deprecated_lines = []
+    successors_lines = []
+    notes_lines = []
 
     def add_param(name, desc='', direction=None):
         if not name:
@@ -358,6 +394,18 @@ def parse_doc(text):
                 return_lines.append(line)
         elif active_section == 'hierarchy':
             hierarchy_lines.append(line)
+        elif active_section == 'see_also':
+            ref = line.strip().rstrip('()')
+            if ref and ref not in see_also_lines:
+                see_also_lines.append(ref)
+        elif active_section == 'deprecated':
+            deprecated_lines.append(line)
+        elif active_section == 'successors':
+            ref = line.strip().rstrip('()')
+            if ref and ref not in successors_lines:
+                successors_lines.append(ref)
+        elif active_section == 'notes':
+            notes_lines.append(line)
         else:
             description_lines.append(line)
 
@@ -404,6 +452,11 @@ def parse_doc(text):
     result['description'] = normalize_space(' '.join(description_lines))
     result['returns'] = normalize_space(' '.join(return_lines))
     result['hierarchy']['lines'] = hierarchy_lines
+    result['see_also'] = see_also_lines
+    result['successors'] = successors_lines
+    result['notes'] = normalize_space(' '.join(notes_lines))
+    if deprecated_lines:
+        result['deprecated'] = normalize_space(' '.join(deprecated_lines))
 
     symbols = []
     ignored = {
@@ -871,6 +924,8 @@ def cleanup_declaration_text(text):
     text = re.sub(r'extern\s+"C(?:\+\+)?"\s*\{', ' ', text)
     text = re.sub(r'(?:inline\s+)?namespace\s+[A-Za-z_]\w*\s*\{', ' ', text)
     text = re.sub(r'\btemplate\s*<[^;{}]*>\s*', ' ', text)
+    # Strip plain 'extern' linkage specifier (common in Creo ProToolkit headers)
+    text = re.sub(r'\bextern\b\s*', ' ', text)
     text = text.strip().rstrip(';').strip()
     if '{' in text:
         text = text.rsplit('{', 1)[-1].strip()
@@ -1113,6 +1168,14 @@ def build_method_record(signature, doc, file_path, line, scope=None, access=None
     }
     if access:
         record['access'] = access
+    if doc.get('see_also'):
+        record['see_also'] = doc['see_also']
+    if doc.get('deprecated') is not None:
+        record['deprecated'] = doc['deprecated']
+    if doc.get('successors'):
+        record['successors'] = doc['successors']
+    if doc.get('notes'):
+        record['notes'] = doc['notes']
     return record
 
 
@@ -1452,7 +1515,13 @@ def extract_global_methods(code, blocks, comments, code_lines, line_starts, file
     for segment in split_declarations_and_definitions(masked):
         meaningful = first_meaningful_offset(segment['text'], segment['start'])
         line = line_for_offset(line_starts, meaningful)
-        doc = parse_doc(nearest_comment_text(comments, code_lines, line))
+        end_line = line_for_offset(line_starts, segment['end'])
+        # Creo ProToolkit headers place documentation AFTER each declaration;
+        # try that first, fall back to the traditional before-comment style.
+        doc_text = nearest_comment_text_after(comments, end_line)
+        if not doc_text:
+            doc_text = nearest_comment_text(comments, code_lines, line)
+        doc = parse_doc(doc_text)
         signature = parse_function_signature(segment['text'])
         if not signature:
             continue
@@ -1546,6 +1615,122 @@ def build_type_records(blocks, code, comments, code_lines, line_starts, file_pat
     return classes, structs, unions, enums
 
 
+def extract_includes(text):
+    includes = []
+    seen = set()
+    for match in re.finditer(r'#\s*include\s+(?P<q>[<"])(?P<name>[^>"]+)[>"]', text):
+        name = match.group('name')
+        if name in seen:
+            continue
+        seen.add(name)
+        includes.append({
+            'file': name,
+            'system': match.group('q') == '<',
+        })
+    return includes
+
+
+def extract_typedefs(code, blocks, comments, code_lines, line_starts, file_path):
+    type_spans = [(block['start'], block['end']) for block in blocks]
+    masked = mask_spans(code, type_spans)
+    masked = flatten_non_type_scopes(masked)
+    typedefs = []
+    seen = set()
+
+    for segment in split_declarations_and_definitions(masked):
+        text = segment['text'].strip()
+        if not re.match(r'typedef\b', text):
+            continue
+        # struct/union/enum typedefs are handled by build_type_records
+        if re.match(r'typedef\s+(?:struct|union|enum)\b', text):
+            continue
+
+        meaningful = first_meaningful_offset(segment['text'], segment['start'])
+        line = line_for_offset(line_starts, meaningful)
+        end_line = line_for_offset(line_starts, segment['end'])
+
+        doc_text = nearest_comment_text_after(comments, end_line)
+        if not doc_text:
+            doc_text = nearest_comment_text(comments, code_lines, line)
+        doc = parse_doc(doc_text)
+
+        body = re.sub(r'^typedef\s+', '', text).rstrip(';').strip()
+
+        # Function pointer typedef: typedef RetType (*Name)(params);
+        fp_match = re.match(
+            r'(?P<ret>.+?)\s*\(\s*\*\s*(?P<name>[A-Za-z_]\w*)\s*\)\s*\((?P<params>.*)\)\s*$',
+            body,
+            re.DOTALL,
+        )
+        if fp_match:
+            name = fp_match.group('name')
+            if name not in seen:
+                seen.add(name)
+                typedefs.append({
+                    'kind': 'function_pointer',
+                    'name': name,
+                    'return_type': normalize_space(fp_match.group('ret')),
+                    'params': normalize_space(fp_match.group('params')),
+                    'file': file_path,
+                    'line': line,
+                    'description': doc['description'],
+                })
+            continue
+
+        # Callback typedef (no star): typedef RetType (Name)(params);
+        cb_match = re.match(
+            r'(?P<ret>.+?)\s*\(\s*(?P<name>[A-Za-z_]\w*)\s*\)\s*\((?P<params>.*)\)\s*$',
+            body,
+            re.DOTALL,
+        )
+        if cb_match and cb_match.group('name') not in TYPE_NAME_STOPWORDS:
+            name = cb_match.group('name')
+            if name not in seen:
+                seen.add(name)
+                typedefs.append({
+                    'kind': 'callback_type',
+                    'name': name,
+                    'return_type': normalize_space(cb_match.group('ret')),
+                    'params': normalize_space(cb_match.group('params')),
+                    'file': file_path,
+                    'line': line,
+                    'description': doc['description'],
+                })
+            continue
+
+        # Simple alias or array alias: typedef OldType NewName[SIZE];
+        array_match = re.search(
+            r'(?P<name>[A-Za-z_]\w*)\s*(?P<arrays>(?:\[[^\]]*\]\s*)+)$', body
+        )
+        if array_match:
+            name = array_match.group('name')
+            array_part = normalize_space(array_match.group('arrays'))
+            original = normalize_space(body[:array_match.start('name')]) + array_part
+        else:
+            identifiers = list(IDENT_RE.finditer(body))
+            if not identifiers:
+                continue
+            chosen = identifiers[-1]
+            name = chosen.group(0)
+            original = normalize_space(body[:chosen.start()])
+
+        if not name or name in TYPE_NAME_STOPWORDS:
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        typedefs.append({
+            'kind': 'alias',
+            'name': name,
+            'original_type': original.strip(),
+            'file': file_path,
+            'line': line,
+            'description': doc['description'],
+        })
+
+    return typedefs
+
+
 def relative_file_path(path, root):
     try:
         return str(path.relative_to(root)).replace('\\', '/')
@@ -1561,6 +1746,7 @@ def extract_header_file(path, root):
     file_path = relative_file_path(path, root)
     constants = {}
 
+    includes = extract_includes(text)
     defines = extract_defines(code, comments, code_lines, file_path, constants)
     blocks = find_type_blocks(code, line_starts)
     classes, structs, unions, enums = build_type_records(
@@ -1573,6 +1759,7 @@ def extract_header_file(path, root):
         constants,
     )
     global_methods = extract_global_methods(code, blocks, comments, code_lines, line_starts, file_path)
+    typedefs = extract_typedefs(code, blocks, comments, code_lines, line_starts, file_path)
 
     return {
         'path': file_path,
@@ -1584,21 +1771,27 @@ def extract_header_file(path, root):
             'enums': len(enums),
             'defines': len(defines),
             'global_methods': len(global_methods),
+            'typedefs': len(typedefs),
+            'includes': len(includes),
         },
+        'includes': includes,
         'classes': classes,
         'structs': structs,
         'unions': unions,
         'enums': enums,
         'defines': defines,
         'global_methods': global_methods,
+        'typedefs': typedefs,
     }
 
 
-def merge_results(file_results, source_root):
+def merge_results(file_results, source_roots):
+    if isinstance(source_roots, (str, Path)):
+        source_roots = [source_roots]
     result = {
         'metadata': {
-            'format_version': 1,
-            'source_root': str(source_root),
+            'format_version': 2,
+            'source_roots': [str(r) for r in source_roots],
             'extractor': 'headerfiles_extractor.py',
         },
         'summary': {
@@ -1609,6 +1802,7 @@ def merge_results(file_results, source_root):
             'enums': 0,
             'defines': 0,
             'global_methods': 0,
+            'typedefs': 0,
             'class_methods': 0,
             'struct_methods': 0,
         },
@@ -1619,6 +1813,7 @@ def merge_results(file_results, source_root):
         'enums': [],
         'defines': [],
         'global_methods': [],
+        'typedefs': [],
     }
 
     for file_result in file_results:
@@ -1626,29 +1821,46 @@ def merge_results(file_results, source_root):
             'path': file_result['path'],
             'encoding': file_result['encoding'],
             'counts': file_result['counts'],
+            'includes': file_result.get('includes', []),
         })
-        for key in ('classes', 'structs', 'unions', 'enums', 'defines', 'global_methods'):
-            result[key].extend(file_result[key])
-            result['summary'][key] += len(file_result[key])
+        for key in ('classes', 'structs', 'unions', 'enums', 'defines', 'global_methods', 'typedefs'):
+            result[key].extend(file_result.get(key, []))
+            result['summary'][key] += len(file_result.get(key, []))
         result['summary']['class_methods'] += sum(len(item['methods']) for item in file_result['classes'])
         result['summary']['struct_methods'] += sum(len(item['methods']) for item in file_result['structs'])
     return result
 
 
-def extract_headers(source, extensions=HEADER_EXTENSIONS, exclude_dirs=None):
-    source = Path(source).resolve()
+def extract_headers(sources, extensions=HEADER_EXTENSIONS, exclude_dirs=None):
+    if isinstance(sources, (str, Path)):
+        sources = [sources]
     exclude_dirs = set(exclude_dirs or [])
-    root = source.parent if source.is_file() else source
-    files = discover_header_files(source, extensions, exclude_dirs)
-    file_results = [extract_header_file(path, root) for path in files]
-    return merge_results(file_results, root)
+    file_results = []
+    roots = []
+    seen_paths = set()
+
+    for source in sources:
+        source = Path(source).resolve()
+        root = source.parent if source.is_file() else source
+        roots.append(root)
+        for path in discover_header_files(source, extensions, exclude_dirs):
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            file_results.append(extract_header_file(path, root))
+
+    return merge_results(file_results, roots)
 
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(
         description='Extract C/C++ header classes, structs, enums, defines, and functions into JSON.',
     )
-    parser.add_argument('source', help='Header file or folder containing .h/.hpp files.')
+    parser.add_argument(
+        'source',
+        nargs='+',
+        help='Header file or folder containing .h/.hpp files. Multiple paths are merged into one output.',
+    )
     parser.add_argument(
         '-o',
         '--output',
@@ -1705,7 +1917,12 @@ def main(argv=None):
     if output_path.parent != Path('.'):
         output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding='utf-8')
-    print(f"Extracted {result['summary']['files']} header files to {output_path}")
+    s = result['summary']
+    print(
+        f"Extracted {s['files']} header files -> {output_path}\n"
+        f"  functions: {s['global_methods']}, enums: {s['enums']}, structs: {s['structs']}, "
+        f"unions: {s['unions']}, defines: {s['defines']}, typedefs: {s['typedefs']}"
+    )
     return 0
 
 
